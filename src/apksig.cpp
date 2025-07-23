@@ -1,14 +1,14 @@
 #include "apksig/apksig.hpp"
 
-#include <fmt/base.h>
-#include <fmt/ranges.h>
-#include <mbedtls/sha256.h>
-
 #include <algorithm>
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
+#include <fstream>
 #include <ios>
+#include <istream>
 #include <iterator>
+#include <stdexcept>
 #include <type_traits>
 #include <vector>
 
@@ -83,50 +83,74 @@ T read_le(std::istream& is) {
   return le_to_host<T>(buf.data());
 }
 
-struct span {
-  uint32_t len;
-  const uint8_t* data;
-  const uint8_t* begin() const noexcept { return data; }
-  const uint8_t* end() const noexcept { return data + len; }
-};
-
-span parse_len_prefix_value(const uint8_t* p) {
-  const auto len = le_to_host<uint32_t>(p);
-  const uint8_t* value = p + sizeof(len);
-  return {len, value};
+std::vector<uint8_t> read_into_vector(std::istream& is, size_t n) {
+  std::vector<uint8_t> out(n);
+  is.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(n));
+  return out;
 }
 
-std::vector<span> parse_len_prefix_seq(const uint8_t* first, const uint8_t* last) {
-  std::vector<span> out;
-  while (first < last) {
-    if (last - first < 4) throw std::runtime_error("truncated sequence");
-    const auto [len, data] = parse_len_prefix_value(first);
-    if (data + len > last) throw std::runtime_error("truncated value in sequence");
-    out.push_back({len, data});
-    first = data + len;
+template <class F>
+auto parse_len_prefixed_seq(uint32_t seq_len, std::istream& is, F f) {
+  std::vector<std::invoke_result_t<F, uint32_t, std::istream&>> out;
+  uint32_t parsed_len = 0;
+  while (parsed_len < seq_len) {
+    const auto len = read_le<uint32_t>(is);
+    out.push_back(f(len, is));
+    parsed_len += sizeof(len) + len;
+    if (parsed_len > seq_len) throw std::runtime_error("Incomplete sequence");
   }
   return out;
 }
 
-std::vector<span> parse_len_prefix_seq(const span s) { return parse_len_prefix_seq(s.data, s.data + s.len); }
-
-std::array<uint8_t, 32> sha256(const uint8_t* in, size_t size) {
-  std::array<uint8_t, 32> out;
-  mbedtls_sha256_context ctx;
-  mbedtls_sha256_init(&ctx);
-  mbedtls_sha256_starts(&ctx, 0);
-  mbedtls_sha256_update(&ctx, in, size);
-  mbedtls_sha256_finish(&ctx, out.data());
-  mbedtls_sha256_free(&ctx);
-  return out;
+apksig::digest parse_digest(uint32_t len, std::istream& is) {
+  const auto sig_algo_id = read_le<uint32_t>(is);
+  const auto digest_data_len = read_le<uint32_t>(is);
+  const auto digest_data = read_into_vector(is, digest_data_len);
+  return {sig_algo_id, digest_data};
 }
 
-std::string hexstr(const uint8_t* p, size_t size) {
-  std::string out;
-  for (size_t i = 0; i < size; i++) {
-    out.append(fmt::format("{:02x}", p[i]));
-  }
-  return out;
+apksig::certificate parse_certificate(uint32_t len, std::istream& is) { return read_into_vector(is, len); }
+
+apksig::add_attr parse_add_attr(uint32_t len, std::istream& is) {
+  const auto id = read_le<uint32_t>(is);
+  const auto value_len = read_le<uint32_t>(is);
+  const auto value = read_into_vector(is, value_len);
+  return {id, value};
+}
+
+apksig::v2_signed_data parse_v2_signed_data(uint32_t len, std::istream& is) {
+  const auto digests_seq_len = read_le<uint32_t>(is);
+  const auto digests = parse_len_prefixed_seq(digests_seq_len, is, parse_digest);
+  const auto certificates_seq_len = read_le<uint32_t>(is);
+  const auto certificates = parse_len_prefixed_seq(certificates_seq_len, is, parse_certificate);
+  const auto add_attrs_seq_len = read_le<uint32_t>(is);
+  const auto add_attrs = parse_len_prefixed_seq(add_attrs_seq_len, is, parse_add_attr);
+  const auto x = read_le<uint32_t>(is);
+  return {digests, certificates, add_attrs};
+}
+
+apksig::signature parse_signature(uint32_t len, std::istream& is) {
+  const auto sig_algo_id = read_le<uint32_t>(is);
+  const auto sig_data_len = read_le<uint32_t>(is);
+  const auto sig_data = read_into_vector(is, sig_data_len);
+  return {sig_algo_id, sig_data};
+}
+
+apksig::public_key parse_public_key(uint32_t len, std::istream& is) { return read_into_vector(is, len); }
+
+apksig::v2_signer parse_v2_signer(uint32_t len, std::istream& is) {
+  const auto signed_data_len = read_le<uint32_t>(is);
+  const auto signed_data = parse_v2_signed_data(signed_data_len, is);
+  const auto signatures_seq_len = read_le<uint32_t>(is);
+  const auto signatures = parse_len_prefixed_seq(signatures_seq_len, is, parse_signature);
+  const auto public_key_len = read_le<uint32_t>(is);
+  const auto public_key = parse_public_key(public_key_len, is);
+  return {signed_data, signatures, public_key};
+}
+
+apksig::v2_block parse_v2_block(uint32_t len, std::istream& is) {
+  const auto signers = parse_len_prefixed_seq(len, is, parse_v2_signer);
+  return {signers};
 }
 
 }  // namespace
@@ -168,64 +192,16 @@ void siginfo::parse() {
     const auto id = read_le<uint32_t>(ifs_);
     // REFACTOR Remove duplciation of reading bytes into v2/v3 vector
     if (id == v2_id) {
-      const auto value_len = read_le<uint32_t>(ifs_);
-      v2_block_buf_.resize(value_len);
-      ifs_.read(reinterpret_cast<char*>(v2_block_buf_.data()), static_cast<std::streamsize>(v2_block_buf_.size()));
+      v2_block_pos_ = ifs_.tellg();
+      const auto v2_block_len = read_le<uint32_t>(ifs_);
+      v2_block_ = parse_v2_block(v2_block_len, ifs_);
     } else if (id == v3_id) {
-      const auto value_len = read_le<uint32_t>(ifs_);
-      v3_block_buf_.resize(value_len);
-      ifs_.read(reinterpret_cast<char*>(v3_block_buf_.data()), static_cast<std::streamsize>(v3_block_buf_.size()));
+      v3_block_pos_ = ifs_.tellg();
+    } else if (id == v3_1_id) {
+      v3_1_block_pos_ = ifs_.tellg();
     }
 
     i += static_cast<std::streamoff>(pair_len + 8);
-  }
-}
-
-void siginfo::parse_v2_block() const {
-  const uint8_t* signer_seq_start = v2_block_buf_.data();
-  const uint8_t* signer_seq_end = signer_seq_start + v2_block_buf_.size();
-
-  const auto signer_spans = parse_len_prefix_seq(signer_seq_start, signer_seq_end);
-
-  for (const auto signer_span : signer_spans) {
-    signed_data signed_data;
-
-    const auto signed_data_span = parse_len_prefix_value(signer_span.data);
-    const auto signatures_seq_span = parse_len_prefix_value(signed_data_span.data + signed_data_span.len);
-    const auto public_key_span = parse_len_prefix_value(signatures_seq_span.data + signatures_seq_span.len);
-
-    // signed data parsing
-    const auto digests_seq_span = parse_len_prefix_value(signed_data_span.data);
-    const auto certificates_seq_span = parse_len_prefix_value(digests_seq_span.data + digests_seq_span.len);
-    const auto add_attr_seq_span = parse_len_prefix_value(certificates_seq_span.data + certificates_seq_span.len);
-
-    std::vector<digest> digests;
-    for (const auto digest_span: parse_len_prefix_seq(digests_seq_span)) {
-      const auto sig_algo_id = le_to_host<uint32_t>(digest_span.data);
-      const auto digest_data_span = parse_len_prefix_value(digest_span.data + sizeof(sig_algo_id));
-      digests.emplace_back(sig_algo_id, digest_data_span.begin(), digest_data_span.end());
-    }
-
-    std::vector<certificate> certificates;
-    for (const auto certificate_span : parse_len_prefix_seq(certificates_seq_span)) {
-      certificates.emplace_back(certificate_span.begin(), certificate_span.end());
-    }
-
-    std::vector<signature> signatures;
-    for (const auto signature_span : parse_len_prefix_seq(signatures_seq_span)) {
-      const auto sig_algo_id = le_to_host<uint32_t>(signature_span.data);
-      const auto sig_span = parse_len_prefix_value(signature_span.data + sizeof(sig_algo_id));
-      signatures.emplace_back(sig_algo_id, sig_span.begin(), sig_span.end());
-    }
-
-    const auto pk_sha256 = sha256(public_key_span.data, public_key_span.len);
-    fmt::println("pk_sha256: {}", hexstr(pk_sha256.data(), pk_sha256.size()));
-
-    fmt::println("signer span len: {}", signer_span.len);
-    fmt::println("signed data span len: {}", signed_data_span.len);
-    fmt::println("signatures seq span len: {}", signatures_seq_span.len);
-    fmt::println("public key span: {}", public_key_span.len);
-    fmt::println("-------------------");
   }
 }
 

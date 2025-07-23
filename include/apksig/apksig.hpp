@@ -10,13 +10,6 @@ namespace apksig {
 struct digest {
   uint32_t sig_algo_id;
   std::vector<uint8_t> digest_data;
-  digest(uint32_t sig_algo_id, const uint8_t *digest_first, const uint8_t *digest_last) : sig_algo_id(sig_algo_id), digest_data(digest_first, digest_last) {}
-};
-
-struct signature {
-  uint32_t sig_algo_id;
-  std::vector<uint8_t> signature_data;
-  signature(uint32_t sig_algo_id, const uint8_t *signature_first, const uint8_t *signature_last) {}
 };
 
 using certificate = std::vector<uint8_t>;
@@ -26,16 +19,23 @@ struct add_attr {
   std::vector<uint8_t> value;
 };
 
-struct signed_data {
+struct v2_signed_data {
   std::vector<digest> digests;
   std::vector<certificate> certificates;
   std::vector<add_attr> add_attrs;
 };
 
+struct signature {
+  uint32_t sig_algo_id;
+  std::vector<uint8_t> signature_data;
+};
+
+using public_key = std::vector<uint8_t>;
+
 struct v2_signer {
-  signed_data signed_data;
+  v2_signed_data signed_data;
   std::vector<signature> signatures;
-  std::vector<uint8_t> public_key;
+  public_key public_key;
 };
 
 struct v2_block {
@@ -46,15 +46,17 @@ class siginfo {
  public:
   siginfo(const std::filesystem::path& apk_file_path);
 
-  bool has_v2_block() const noexcept { return !v2_block_buf_.empty(); };
-  bool has_v3_block() const noexcept { return !v3_block_buf_.empty(); };
+  bool has_v2_block() const noexcept { return v2_block_pos_ != -1; };
+  bool has_v3_block() const noexcept { return v3_block_pos_ != -1; };
+  bool has_v3_1_block() const noexcept { return v3_1_block_pos_ != -1; };
   void parse();
-  void parse_v2_block() const;
+  const v2_block& get_v2_block() const noexcept { return v2_block_; }
 
  private:
   std::ifstream ifs_;
-  std::vector<uint8_t> v2_block_buf_;
-  std::vector<uint8_t> v3_block_buf_;
+  std::streampos v2_block_pos_ = -1;
+  std::streampos v3_block_pos_ = -1;
+  std::streampos v3_1_block_pos_ = -1;
   v2_block v2_block_;
 
   static constexpr std::array<std::uint8_t, 4> eocd_magic{0x50, 0x4B, 0x05, 0x06};
